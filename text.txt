@@ -1,0 +1,310 @@
+T _watcher/watch/cve-report-by-artifact
+{
+  "trigger": {
+    "schedule": {
+      "cron": "0 0 8 * * MON"
+    }
+  },
+  "input": {
+    "search": {
+      "request": {
+        "indices": ["ton-index-cve-*"],
+        "body": {
+          "size": 100,
+          "query": {
+            "bool": {
+              "filter": [
+                {
+                  "terms": {
+                    "top_severity": ["Critical", "High"]
+                  }
+                }
+              ]
+            }
+          },
+          "_source": [
+            "cve",
+            "component",
+            "version",
+            "fixed_versions",
+            "top_severity",
+            "top_severity_number",
+            "artifact.name",
+            "labels.code_appli",
+            "service.environment",
+            "kubernetes.namespace"
+          ]
+        }
+      }
+    }
+  },
+  "condition": {
+    "compare": {
+      "ctx.payload.hits.total.value": {
+        "gt": 0
+      }
+    }
+  },
+  "transform": {
+    "script": {
+      "lang": "painless",
+      "source": """
+
+        // ââ 1. Pivot : construire une map artefact â donnÃ©es agrÃ©gÃ©es
+        def artifactMap = new LinkedHashMap();
+
+        for (def hit : ctx.payload.hits.hits) {
+          def src = hit._source;
+
+          def artifacts  = src['artifact.name']       instanceof List ? src['artifact.name']       : (src['artifact.name']       != null ? [src['artifact.name']]       : []);
+          def envs       = src['service.environment'] instanceof List ? src['service.environment'] : (src['service.environment'] != null ? [src['service.environment']] : []);
+          def codeApplis = src['labels.code_appli']   instanceof List ? src['labels.code_appli']   : (src['labels.code_appli']   != null ? [src['labels.code_appli']]   : []);
+
+          def cve       = src['cve']               instanceof List ? src['cve'][0]               : src['cve'];
+          def component = src['component']         instanceof List ? src['component'][0]         : src['component'];
+          def version   = src['version']           instanceof List ? src['version'][0]           : src['version'];
+          def fixed     = src['fixed_versions']    instanceof List ? src['fixed_versions'][0]    : src['fixed_versions'];
+          def severity  = src['top_severity']      instanceof List ? src['top_severity'][0]      : src['top_severity'];
+          def sevNum    = src['top_severity_number'] instanceof List ? src['top_severity_number'][0] : src['top_severity_number'];
+
+          for (def artifact : artifacts) {
+            if (!artifactMap.containsKey(artifact)) {
+              artifactMap[artifact] = [
+                'cves'       : new LinkedHashSet(),
+                'components' : new LinkedHashSet(),
+                'envs'       : new LinkedHashSet(),
+                'codeApplis' : new LinkedHashSet(),
+                'maxSevNum'  : 0,
+                'maxSev'     : '',
+                'fixes'      : new LinkedHashMap()
+              ];
+            }
+            def entry = artifactMap[artifact];
+            entry['cves'].add(cve);
+            entry['components'].add(component + ':' + version);
+            for (def e : envs)       { entry['envs'].add(e); }
+            for (def c : codeApplis) { entry['codeApplis'].add(c); }
+            if (sevNum > entry['maxSevNum']) {
+              entry['maxSevNum'] = sevNum;
+              entry['maxSev']    = severity;
+            }
+            if (fixed != null) {
+              entry['fixes'][cve] = fixed;
+            }
+          }
+        }
+
+        // ââ 2. Trier par sÃ©vÃ©ritÃ© dÃ©croissante, prod en premier
+        def sorted = new ArrayList(artifactMap.entrySet());
+        sorted.sort((a, b) -> {
+          def aIsProd = a.getValue()['envs'].contains('pr') ? 0 : 1;
+          def bIsProd = b.getValue()['envs'].contains('pr') ? 0 : 1;
+          if (aIsProd != bIsProd) return aIsProd <=> bIsProd;
+          return b.getValue()['maxSevNum'] <=> a.getValue()['maxSevNum'];
+        });
+
+        // ââ 3. Couleurs sÃ©vÃ©ritÃ© et environnement
+        def sevColors = [
+          'Critical' : '#c0392b',
+          'High'     : '#e67e22',
+          'Medium'   : '#f39c12',
+          'Low'      : '#27ae60'
+        ];
+        def envBgColors = [
+          'pr' : '#fdecea',
+          'va' : '#fef9e7',
+          'rc' : '#eaf4fb',
+          'di' : '#eafaf1'
+        ];
+        def envTxtColors = [
+          'pr' : '#c0392b',
+          'va' : '#d35400',
+          'rc' : '#2980b9',
+          'di' : '#27ae60'
+        ];
+
+        // ââ 4. Compteurs KPI
+        def totalArtifacts = sorted.size();
+        def prodArtifacts  = 0;
+        def codeAppliSet   = new LinkedHashSet();
+        for (def entry : sorted) {
+          if (entry.getValue()['envs'].contains('pr')) { prodArtifacts++; }
+          for (def c : entry.getValue()['codeApplis']) { codeAppliSet.add(c); }
+        }
+        def totalCodeApplis = codeAppliSet.size();
+
+        // ââ 5. Construction des lignes du tableau
+        def rows = new StringBuilder();
+        def isOdd = true;
+
+        for (def entry : sorted) {
+          def name   = entry.getKey();
+          def data   = entry.getValue();
+          def isProd = data['envs'].contains('pr');
+          def sev    = data['maxSev'];
+          def sevColor = sevColors.containsKey(sev) ? sevColors[sev] : '#999999';
+          def rowBg  = isProd ? '#fff5f5' : (isOdd ? '#ffffff' : '#fafafa');
+          isOdd = !isOdd;
+
+          // Badge PROD
+          def prodHtml = isProd
+            ? '<span style="display:inline-block;background:#c0392b;color:white;font-size:9px;font-weight:bold;padding:2px 6px;border-radius:3px;letter-spacing:0.5px;margin-bottom:4px">PROD</span><br/>'
+            : '';
+
+          // Badges environnement
+          def envHtml = new StringBuilder();
+          def envOrder = ['pr', 'va', 'rc', 'di'];
+          for (def envKey : envOrder) {
+            if (data['envs'].contains(envKey)) {
+              def bg  = envBgColors.containsKey(envKey)  ? envBgColors[envKey]  : '#ecf0f1';
+              def txt = envTxtColors.containsKey(envKey) ? envTxtColors[envKey] : '#555555';
+              envHtml.append('<span style="display:inline-block;background:' + bg + ';color:' + txt + ';padding:2px 7px;border-radius:3px;font-size:10px;font-weight:bold;margin:1px;border:1px solid ' + txt + '22">' + envKey + '</span>');
+            }
+          }
+
+          // Composants vulnÃ©rables
+          def compHtml = new StringBuilder();
+          for (def comp : data['components']) {
+            compHtml.append('<span style="display:block;font-family:Courier New,monospace;font-size:10px;color:#555555;margin-bottom:2px">' + comp + '</span>');
+          }
+
+          // CVE IDs
+          def cveHtml = new StringBuilder();
+          for (def cve : data['cves']) {
+            cveHtml.append('<span style="display:block;font-family:Courier New,monospace;font-size:10px;color:#c0392b;font-weight:bold;margin-bottom:2px">' + cve + '</span>');
+          }
+
+          // Fix disponible
+          def fixHtml = new StringBuilder();
+          if (data['fixes'].isEmpty()) {
+            fixHtml.append('<span style="color:#c0392b;font-size:11px">â ï¸ Aucun fix connu</span>');
+          } else {
+            for (def f : data['fixes'].entrySet()) {
+              fixHtml.append(
+                '<span style="color:#27ae60;font-size:11px">â ' + f.getKey() + '</span><br/>' +
+                '<span style="font-family:Courier New,monospace;font-size:10px;color:#27ae60;font-weight:bold;margin-left:14px">â ' + f.getValue() + '</span><br/>'
+              );
+            }
+            // CVE sans fix
+            for (def cve : data['cves']) {
+              if (!data['fixes'].containsKey(cve)) {
+                fixHtml.append('<span style="color:#c0392b;font-size:11px">â ï¸ ' + cve + ' â aucun fix</span><br/>');
+              }
+            }
+          }
+
+          // Code appli
+          def appList = String.join(', ', new ArrayList(data['codeApplis']));
+
+          // Bordure gauche rouge si prod
+          def leftBorder = isProd ? 'border-left:3px solid #c0392b;' : 'border-left:3px solid transparent;';
+
+          rows.append(
+            '<tr style="background:' + rowBg + ';border-bottom:1px solid #eeeeee;' + leftBorder + '">' +
+
+            '<td style="padding:10px 8px;vertical-align:top">' +
+              prodHtml +
+              '<span style="font-family:Courier New,monospace;font-size:11px;color:#2c3e50;font-weight:bold;word-break:break-all">' + name + '</span>' +
+            '</td>' +
+
+            '<td style="padding:10px 8px;vertical-align:top;font-size:12px;color:#444444">' + appList + '</td>' +
+
+            '<td style="padding:10px 8px;vertical-align:top">' + envHtml.toString() + '</td>' +
+
+            '<td style="padding:10px 8px;vertical-align:top">' + compHtml.toString() + '</td>' +
+
+            '<td style="padding:10px 8px;vertical-align:top">' + cveHtml.toString() + '</td>' +
+
+            '<td style="padding:10px 8px;vertical-align:top;text-align:center">' +
+              '<span style="display:inline-block;background:' + sevColor + ';color:white;padding:4px 10px;border-radius:4px;font-size:10px;font-weight:bold;letter-spacing:0.3px">' + sev + '</span>' +
+            '</td>' +
+
+            '<td style="padding:10px 8px;vertical-align:top">' + fixHtml.toString() + '</td>' +
+
+            '</tr>'
+          );
+        }
+
+        // ââ 6. Assemblage HTML final
+        def date = ctx.execution_time.toString().substring(0, 10);
+
+        ctx.vars.html_body =
+          '<html><body style="margin:0;padding:0;background:#e8eaed;font-family:Arial,sans-serif">' +
+
+          // Wrapper centrÃ©
+          '<div style="max-width:900px;margin:0 auto;padding:24px 16px">' +
+
+          // Header
+          '<div style="background:#2c3e50;border-radius:6px 6px 0 0;padding:20px 24px">' +
+            '<p style="margin:0;font-size:18px;font-weight:bold;color:#ffffff">ð Rapport CVE par artefact</p>' +
+            '<p style="margin:4px 0 0 0;font-size:12px;color:#95a5a6">SÃ©vÃ©ritÃ©s : <strong style="color:#e74c3c">Critical</strong> et <strong style="color:#e67e22">High</strong> â GÃ©nÃ©rÃ© le ' + date + ' â TriÃ© prod en premier, puis sÃ©vÃ©ritÃ© dÃ©croissante</p>' +
+          '</div>' +
+
+          // Corps
+          '<div style="background:#ffffff;border-radius:0 0 6px 6px;padding:24px">' +
+
+          // KPIs via table HTML (compatible Outlook)
+          '<table style="border-collapse:separate;border-spacing:12px 0;margin-bottom:20px;margin-left:-12px"><tr>' +
+            '<td style="padding:14px 20px;background:#fdf3f3;border-left:4px solid #c0392b;border-radius:4px;min-width:100px;vertical-align:top">' +
+              '<div style="font-size:28px;font-weight:bold;color:#c0392b;line-height:1">' + totalArtifacts + '</div>' +
+              '<div style="font-size:11px;color:#666666;margin-top:4px">artefacts impactÃ©s</div>' +
+            '</td>' +
+            '<td style="padding:14px 20px;background:#fef9f3;border-left:4px solid #e67e22;border-radius:4px;min-width:100px;vertical-align:top">' +
+              '<div style="font-size:28px;font-weight:bold;color:#e67e22;line-height:1">' + prodArtifacts + '</div>' +
+              '<div style="font-size:11px;color:#666666;margin-top:4px">en production (pr)</div>' +
+            '</td>' +
+            '<td style="padding:14px 20px;background:#f3f8fd;border-left:4px solid #2980b9;border-radius:4px;min-width:100px;vertical-align:top">' +
+              '<div style="font-size:28px;font-weight:bold;color:#2980b9;line-height:1">' + totalCodeApplis + '</div>' +
+              '<div style="font-size:11px;color:#666666;margin-top:4px">codes appli concernÃ©s</div>' +
+            '</td>' +
+          '</tr></table>' +
+
+          // LÃ©gende
+          '<div style="background:#fffbf0;border-left:3px solid #f1c40f;padding:8px 12px;font-size:12px;color:#666666;margin-bottom:16px;border-radius:2px">' +
+            'ð´ Bordure rouge + fond rosÃ© = artefact prÃ©sent en <strong>production (pr)</strong>. Les artefacts prod apparaissent en premier.' +
+          '</div>' +
+
+          // Tableau
+          '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+
+          // Header tableau
+          '<thead>' +
+          '<tr style="background:#2c3e50;color:#ffffff">' +
+            '<th style="padding:10px 8px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;width:22%">Artefact</th>' +
+            '<th style="padding:10px 8px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;width:8%">Appli</th>' +
+            '<th style="padding:10px 8px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;width:10%">Envs</th>' +
+            '<th style="padding:10px 8px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;width:16%">Composant vulnÃ©rable</th>' +
+            '<th style="padding:10px 8px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;width:14%">CVE</th>' +
+            '<th style="padding:10px 8px;text-align:center;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;width:8%">SÃ©vÃ©ritÃ©</th>' +
+            '<th style="padding:10px 8px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;width:22%">Fix disponible</th>' +
+          '</tr>' +
+          '</thead>' +
+
+          '<tbody>' + rows.toString() + '</tbody>' +
+          '</table>' +
+
+          // Footer
+          '<p style="margin-top:20px;padding-top:12px;border-top:1px solid #eeeeee;font-size:10px;color:#bbbbbb;text-align:center">' +
+            'GÃ©nÃ©rÃ© automatiquement par Elasticsearch Watcher Â· ' + date +
+          '</p>' +
+
+          '</div>' + // fin corps
+          '</div>' + // fin wrapper
+          '</body></html>';
+
+        return ctx.payload;
+      """
+    }
+  },
+  "actions": {
+    "send_email": {
+      "email": {
+        "to": ["ton-equipe@ta-banque.fr"],
+        "subject": "ð CVE Critical/High par artefact â {{ctx.execution_time}}",
+        "body": {
+          "html": "{{ctx.vars.html_body}}"
+        }
+      }
+    }
+  }
+}
